@@ -1,0 +1,20 @@
+{
+  "name": "ss-shopify-sync",
+  "version": "1.0.0",
+  "description": "SS Activewear to Shopify sync tool",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node test-connection.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.15.2",
+    "dotenv": "^17.4.2",
+    "shopify-api-node": "^3.15.0",
+    "sqlite3": "^6.0.1"
+  }
+}
