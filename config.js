@@ -14,11 +14,13 @@ export const CONFIG = {
     baseUrl: 'https://api.ssactivewear.com/v2',
   },
   sync: {
-    batchSize: 50,
-    syncInterval: 3600000,
-    priceMarkup: 1.5,
-    autoPublish: false,
-  }
+    styleBatchSize:       parseInt(process.env.STYLE_BATCH_SIZE    || '40'),
+    shopifyBatchSize:     parseInt(process.env.SHOPIFY_BATCH_SIZE  || '5'),
+    requestDelay:         parseInt(process.env.REQUEST_DELAY       || '500'),
+    priceMarkupMultiplier: 1.40,
+    autoPublish:          process.env.AUTO_PUBLISH === 'true',
+    primaryLocationName:  process.env.PRIMARY_LOCATION_NAME || '9400 Harwin Dr.',
+  },
 };
 
 const required = [

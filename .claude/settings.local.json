@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(del test.js)",
+      "Bash(dir \"C:\\\\Users\\\\DELL\\\\Desktop\\\\Projects\\\\ss-shopify-sync\" /b /a-d)",
+      "Bash(node --check index.js)",
+      "Bash(node --check ss-api.js)",
+      "Bash(node --check sync.js)",
+      "Bash(node --check transformer.js)",
+      "Bash(node --check inventory.js)",
+      "Bash(node --check shopify-api.js)",
+      "Bash(node --check config.js)"
+    ]
+  }
+}

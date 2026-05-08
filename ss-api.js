@@ -2,50 +2,19 @@ import { CONFIG } from './config.js';
 
 class SSActiveWearAPI {
   constructor() {
-    this.baseUrl = 'https://api.ssactivewear.com'; // Fixed: removed /v2
-    this.username = CONFIG.ssActivewear.username;
-    this.password = CONFIG.ssActivewear.password;
-    this.token = null;
-  }
-
-  async authenticate() {
-    try {
-      // SS Activewear uses Basic Auth, not Bearer token
-      const credentials = btoa(`${this.username}:${this.password}`);
-      
-      console.log(`🔄 Authenticating with SS Activewear (Account: ${this.username})...`);
-      
-      // Test with a simple API call instead of separate auth
-      const response = await fetch(`${this.baseUrl}/v2/products/`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Basic ${credentials}`,
-          'Content-Type': 'application/json',
-        },
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`SS API test failed: ${response.status} - ${errorText}`);
-      }
-
-      // If we get here, credentials work
-      this.credentials = credentials;
-      console.log('✅ SS Activewear authenticated');
-      return true;
-    } catch (error) {
-      console.error('❌ SS Authentication error:', error.message);
-      throw error;
-    }
+    this.baseUrl     = 'https://api.ssactivewear.com';
+    this.username    = CONFIG.ssActivewear.username;
+    this.password    = CONFIG.ssActivewear.password;
+    this.credentials = btoa(`${this.username}:${this.password}`);
+    console.log(`✅ SS Activewear credentials set (Account: ${this.username})`);
   }
 
   async makeRequest(endpoint, options = {}) {
-    if (!this.credentials) {
-      await this.authenticate();
-    }
+    // Re-read credentials fresh from env on every request in case .env changed between runs
+    this.credentials = btoa(`${process.env.SS_USERNAME?.trim()}:${process.env.SS_PASSWORD?.trim()}`);
 
     const url = endpoint.startsWith('http') ? endpoint : `${this.baseUrl}${endpoint}`;
-    
+
     const response = await fetch(url, {
       ...options,
       headers: {
@@ -55,14 +24,8 @@ class SSActiveWearAPI {
       },
     });
 
-    if (response.status === 401) {
-      // Credentials invalid
-      console.log('🔄 Re-authenticating...');
-      this.credentials = null;
-      await this.authenticate();
-      return this.makeRequest(endpoint, options);
-    }
-
+    if (response.status === 401) throw new Error('SS Activewear: Invalid credentials (401)');
+    if (response.status === 404) return null;
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(`SS API error: ${response.status} - ${errorText}`);
@@ -71,78 +34,116 @@ class SSActiveWearAPI {
     return response.json();
   }
 
-  // Get all products (single call, no pagination)
-  async getAllProducts() {
-    console.log('🔄 Fetching all SS products...');
-    try {
-      const data = await this.makeRequest('/v2/products/');
-      console.log(`✅ Fetched ${data.length || 0} products from SS Activewear`);
-      return data;
-    } catch (error) {
-      console.error('❌ Failed to fetch products:', error.message);
-      throw error;
-    }
+  // ─── Styles API ───────────────────────────────────────────────────────────────
+  // Lightweight — returns text metadata only (no images), safe to fetch all at once.
+
+  async getAllStyles() {
+    console.log('🔄 Fetching all SS Activewear styles...');
+    const data = await this.makeRequest('/v2/styles/');
+    console.log(`✅ Found ${data?.length || 0} styles`);
+    return data || [];
   }
 
-  // Test different endpoints to find the right one
-  async testConnection() {
-    try {
-      console.log('🧪 Testing SS Activewear connection...');
-      
-      // Try basic authentication first
-      await this.authenticate();
-      
-      // Try to fetch a small amount of data
-      const products = await this.getAllProducts();
-      console.log('✅ SS Activewear connection successful!');
-      console.log(`   Products available: ${products.length}`);
-      return true;
-    } catch (error) {
-      console.error('❌ SS Activewear connection failed:', error.message);
-      
-      // Try alternative endpoints
-      console.log('🔄 Trying alternative SS API endpoints...');
-      const endpoints = [
-        '/v2/products',
-        '/products',
-        '/v1/products',
-      ];
-      
-      for (const endpoint of endpoints) {
-        try {
-          console.log(`   Testing: ${endpoint}`);
-          const credentials = btoa(`${this.username}:${this.password}`);
-          const response = await fetch(`${this.baseUrl}${endpoint}`, {
-            headers: { 'Authorization': `Basic ${credentials}` }
-          });
-          
-          if (response.ok) {
-            console.log(`✅ Working endpoint found: ${endpoint}`);
-            this.workingEndpoint = endpoint;
-            return true;
-          } else {
-            console.log(`   ❌ ${endpoint}: ${response.status}`);
-          }
-        } catch (err) {
-          console.log(`   ❌ ${endpoint}: ${err.message}`);
-        }
+  // Returns Map<styleID (integer), styleObject> for O(1) lookup.
+  async getStyleMap() {
+    const styles = await this.getAllStyles();
+    const map = new Map();
+    for (const s of styles) map.set(s.styleID, s);
+    return map;
+  }
+
+  // Fetch style data for a specific set of IDs (used in partial/SKU syncs).
+  async getStylesByIds(styleIds) {
+    if (!styleIds.length) return new Map();
+    const data = await this.makeRequest(`/v2/styles/?styleid=${styleIds.join(',')}`);
+    const map = new Map();
+    for (const s of (data || [])) map.set(s.styleID, s);
+    return map;
+  }
+
+  // ─── Products API ─────────────────────────────────────────────────────────────
+
+  // Fetch all SKU rows for a batch of style IDs.
+  // This is the core building block for the chunked full-catalog fetch.
+  async getProductsByStyleIds(styleIds) {
+    if (!styleIds.length) return [];
+    const data = await this.makeRequest(`/v2/products/?styleid=${styleIds.join(',')}`);
+    return data || [];
+  }
+
+  // Fetch SKU rows for specific SKUs (used in partial sync).
+  async getProductsBySkus(skus) {
+    if (!skus.length) return [];
+    const data = await this.makeRequest(`/v2/products/${skus.join(',')}`);
+    return data || [];
+  }
+
+  async getProduct(sku) {
+    return this.makeRequest(`/v2/products/${sku}`);
+  }
+
+  // ─── Chunked full-catalog fetch ───────────────────────────────────────────────
+  //
+  // /v2/products/ returns 1 GB+ unfiltered — never call it without a styleid filter.
+  //
+  // Strategy:
+  //   1. Fetch all styles (lightweight text-only response, ~a few MB)
+  //   2. Chunk style IDs into groups of `chunkSize`
+  //   3. For each chunk: GET /v2/products/?styleid=id1,id2,...
+  //
+  // The styleMap is passed to every onBatch call so the transformer can look up
+  // the HTML description, baseCategory, etc. without extra API calls.
+  //
+  // Callback signature: onBatch(skuRows, styleMap, chunkIndex, totalChunks)
+
+  async fetchAllProductsInChunks(onBatch, chunkSize = CONFIG.sync.styleBatchSize) {
+    const styleMap = await this.getStyleMap();
+    const styleIds = [...styleMap.keys()];
+
+    if (!styleIds.length) {
+      console.warn('⚠️  No styles returned from SS Activewear');
+      return;
+    }
+
+    const totalChunks = Math.ceil(styleIds.length / chunkSize);
+    console.log(`\n📦 ${styleIds.length} styles → ${totalChunks} chunk(s) of up to ${chunkSize}`);
+
+    for (let i = 0; i < styleIds.length; i += chunkSize) {
+      const chunk      = styleIds.slice(i, i + chunkSize);
+      const chunkIndex = Math.floor(i / chunkSize) + 1;
+
+      console.log(`\n🔄 Chunk ${chunkIndex}/${totalChunks} — styles ${i + 1}–${Math.min(i + chunkSize, styleIds.length)}`);
+
+      try {
+        const products = await this.getProductsByStyleIds(chunk);
+        console.log(`   ↳ ${products.length} SKU row(s) returned`);
+        await onBatch(products, styleMap, chunkIndex, totalChunks);
+      } catch (err) {
+        console.error(`   ❌ Chunk ${chunkIndex} failed: ${err.message}`);
       }
-      
-      return false;
+
+      await sleep(CONFIG.sync.requestDelay);
     }
+
+    console.log('\n✅ All chunks processed');
   }
 
-  // Get product details
-  async getProductDetails(productId) {
-    console.log(`🔄 Fetching details for product: ${productId}`);
-    return this.makeRequest(`/v2/products/${productId}/`);
-  }
+  // ─── Connection test ──────────────────────────────────────────────────────────
+  // Fetches a single known style (Gildan 2000) — lightweight, fast, verifies auth.
 
-  // Get categories
-  async getCategories() {
-    console.log('🔄 Fetching categories...');
-    return this.makeRequest('/v2/categories/');
+  async testConnection() {
+    console.log('🧪 Testing SS Activewear connection...');
+    const data = await this.makeRequest('/v2/styles/?styleid=39');
+    if (data?.length) {
+      console.log(`✅ SS Activewear connected — sample style: ${data[0].brandName} ${data[0].title}`);
+      return true;
+    }
+    throw new Error('SS Activewear: unexpected empty response on connection test');
   }
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 export { SSActiveWearAPI };
