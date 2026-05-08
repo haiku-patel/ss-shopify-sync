@@ -20,6 +20,7 @@ export const CONFIG = {
     priceMarkupMultiplier: 1.40,
     autoPublish:          process.env.AUTO_PUBLISH === 'true',
     primaryLocationName:  process.env.PRIMARY_LOCATION_NAME || '9400 Harwin Dr.',
+    dailyVariantLimit:    parseInt(process.env.DAILY_VARIANT_LIMIT || '2000'),
   },
 };
 

@@ -486,12 +486,7 @@ class ShopifyAPI {
     const publications = await this.getPublications();
     if (!publications.length) return;
 
-    const externalChannels = publications.filter(p => {
-      const name = p.name.toLowerCase();
-      return !name.includes('online store') && !name.includes('point of sale');
-    });
-
-    for (const pub of externalChannels) {
+    for (const pub of publications) {
       try {
         await this.graphqlRequest(`
           mutation productPublish($input: ProductPublishInput!) {

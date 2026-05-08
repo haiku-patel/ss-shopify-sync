@@ -1,3 +1,4 @@
+import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { SSActiveWearAPI }   from './ss-api.js';
 import { ShopifyAPI }        from './shopify-api.js';
 import { InventoryManager }  from './inventory.js';
@@ -13,11 +14,13 @@ import {
   ssImageUrl,
 } from './transformer.js';
 
+const CHECKPOINT_FILE = './sync-checkpoint.json';
+
 // Shopify REST API hard limit — styles with more variants are split by color
 const MAX_REST_VARIANTS = 100;
 
 class ProductSync {
-  constructor() {
+  constructor({ initial = false, resume = false } = {}) {
     this.ssApi       = new SSActiveWearAPI();
     this.shopify     = new ShopifyAPI();
     this.inventory   = null;
@@ -35,6 +38,64 @@ class ProductSync {
     //   "styleId:colorKey" (string) — styles split by color (one product per color group)
     this.existingProductMap = new Map();
     this.seenProductKeys    = new Set();
+
+    this.resumeMode          = resume;
+    this.initialLoad         = initial || resume; // resume implies initial load
+    this.checkpoint          = null;
+    this.variantLimitReached = false;
+  }
+
+  // ─── Checkpoint ───────────────────────────────────────────────────────────
+
+  _loadCheckpoint() {
+    const today = new Date().toISOString().slice(0, 10);
+    if (this.resumeMode && existsSync(CHECKPOINT_FILE)) {
+      try {
+        const raw = JSON.parse(readFileSync(CHECKPOINT_FILE, 'utf8'));
+        // Same day: keep variant count so we don't blow past the daily limit again.
+        // New day: reset variant count (quota refreshed) but keep processedKeys.
+        const sameDay = raw.date === today;
+        this.checkpoint = {
+          date:            today,
+          variantsCreated: sameDay ? (raw.variantsCreated || 0) : 0,
+          processedKeys:   new Set(raw.processedKeys || []),
+        };
+        console.log(`📂 Checkpoint loaded: ${this.checkpoint.processedKeys.size} style(s) already done, ${this.checkpoint.variantsCreated} variants created today`);
+        return;
+      } catch (_) {
+        console.warn('⚠️  Could not read checkpoint — starting fresh');
+      }
+    }
+    this.checkpoint = { date: today, variantsCreated: 0, processedKeys: new Set() };
+  }
+
+  _saveCheckpoint() {
+    if (!this.checkpoint) return;
+    try {
+      writeFileSync(CHECKPOINT_FILE, JSON.stringify({
+        date:            this.checkpoint.date,
+        variantsCreated: this.checkpoint.variantsCreated,
+        processedKeys:   [...this.checkpoint.processedKeys],
+      }, null, 2));
+    } catch (err) {
+      console.warn(`⚠️  Could not save checkpoint: ${err.message}`);
+    }
+  }
+
+  _canCreateVariants(count) {
+    const limit = CONFIG.sync.dailyVariantLimit;
+    if (!limit || limit <= 0) return true;
+    if (this.checkpoint.variantsCreated + count > limit) {
+      if (!this.variantLimitReached) {
+        this.variantLimitReached = true;
+        console.warn(`\n⚠️  Daily variant limit (${limit.toLocaleString()}) reached.`);
+        console.warn(`   Variants created today: ${this.checkpoint.variantsCreated.toLocaleString()}`);
+        console.warn(`   Run tomorrow with: node index.js --resume`);
+        this._saveCheckpoint();
+      }
+      return false;
+    }
+    return true;
   }
 
   // ─── Public entry points ──────────────────────────────────────────────────
@@ -44,17 +105,19 @@ class ProductSync {
     console.log('   SS Activewear → Shopify FULL SYNC');
     console.log('═══════════════════════════════════\n');
 
+    if (this.initialLoad) this._loadCheckpoint();
     await this._init();
     await this._loadExistingShopifyProducts();
 
     await this.ssApi.fetchAllProductsInChunks(
       async (skuRows, styleMap, chunkIndex, total) => {
+        if (this.variantLimitReached) return;
         await this._processChunk(skuRows, styleMap, chunkIndex, total);
         this.stats.chunksProcessed++;
       }
     );
 
-    await this._removeStaleListings();
+    if (!this.variantLimitReached) await this._removeStaleListings();
     this._printStats();
   }
 
@@ -176,10 +239,22 @@ class ProductSync {
           const colorKey = sanitizeColorKey(colorName);
           const key      = `${styleId}:${colorKey}`;
           this.seenProductKeys.add(key);
+
+          if (this.initialLoad && this.resumeMode && this.checkpoint.processedKeys.has(key)) {
+            console.log(`   ⏩ ${key}: skipped (already processed)`);
+            continue;
+          }
+
           if (this.existingProductMap.has(key)) {
             await this._diffAndUpdate(key, colorRows, styleData, colorName);
           } else {
+            if (this.variantLimitReached) continue;
             await this._createProduct(key, colorRows, styleData, colorName);
+          }
+
+          if (this.initialLoad && !this.variantLimitReached) {
+            this.checkpoint.processedKeys.add(key);
+            this._saveCheckpoint();
           }
         }
         return;
@@ -187,10 +262,23 @@ class ProductSync {
 
       // Step 3: regular single-product path
       this.seenProductKeys.add(styleId);
+
+      if (this.initialLoad && this.resumeMode && this.checkpoint.processedKeys.has(styleId)) {
+        console.log(`   ⏩ Style ${styleId}: skipped (already processed)`);
+        return;
+      }
+
       if (this.existingProductMap.has(styleId)) {
         await this._diffAndUpdate(styleId, validRows, styleData);
       } else {
-        await this._createProduct(styleId, validRows, styleData);
+        if (!this.variantLimitReached) {
+          await this._createProduct(styleId, validRows, styleData);
+        }
+      }
+
+      if (this.initialLoad && !this.variantLimitReached) {
+        this.checkpoint.processedKeys.add(styleId);
+        this._saveCheckpoint();
       }
 
     } catch (err) {
@@ -203,6 +291,8 @@ class ProductSync {
   // ─── Create ───────────────────────────────────────────────────────────────
 
   async _createProduct(key, rows, styleData, colorName = null) {
+    if (this.initialLoad && !this._canCreateVariants(rows.length)) return;
+
     const sample = rows[0];
     const { product, variantMeta } = transformStyleToShopifyProduct(rows, styleData);
 
@@ -211,7 +301,7 @@ class ProductSync {
     product.tags += `,${ssTag}`;
 
     if (colorName) product.title += ` - ${colorName}`;
-    product.status = 'draft';
+    product.status = 'active';
 
     console.log(`\n   ✨ Creating: "${product.title}"`);
     console.log(`      Variants: ${product.variants.length} | Tags: ${product.tags.slice(0, 100)}…`);
@@ -234,6 +324,7 @@ class ProductSync {
 
     console.log(`      ✅ Created → Shopify ID: ${created.id}`);
     this.existingProductMap.set(key, created.id);
+    if (this.initialLoad) this.checkpoint.variantsCreated += created.variants.length;
 
     console.log(`      📦 Setting inventory...`);
     await this.inventory.setInventoryForProduct(created.variants, variantMeta);
@@ -362,8 +453,13 @@ class ProductSync {
 
   async _applyVariantChanges(productId, { toAdd, toUpdate, toDelete }) {
     for (const v of toAdd) {
+      if (this.initialLoad && !this._canCreateVariants(1)) {
+        console.warn(`     ⏸️  Skipping variant add ${v.sku} — daily limit reached`);
+        continue;
+      }
       try {
         await this.shopify.createVariant(productId, v);
+        if (this.initialLoad) this.checkpoint.variantsCreated += 1;
         console.log(`     ➕ Added variant: ${v.sku}`);
       } catch (err) {
         console.error(`     ⚠️  Add variant ${v.sku}: ${err.message}`);
@@ -538,8 +634,9 @@ class ProductSync {
   // ─── Stats ────────────────────────────────────────────────────────────────
 
   _printStats() {
+    const paused = this.variantLimitReached;
     console.log('\n╔══════════════════════════════════╗');
-    console.log('║         Sync Complete!           ║');
+    console.log(paused ? '║      Sync Paused (limit hit)     ║' : '║         Sync Complete!           ║');
     console.log('╠══════════════════════════════════╣');
     console.log(`║  ✨ Created:              ${String(this.stats.created).padStart(5)} ║`);
     console.log(`║  🔄 Updated:              ${String(this.stats.updated).padStart(5)} ║`);
@@ -548,7 +645,15 @@ class ProductSync {
     console.log(`║  ⏭️  Skipped (dropship):   ${String(this.stats.skippedDropship).padStart(5)} ║`);
     console.log(`║  ⏭️  Skipped (OOS):        ${String(this.stats.skippedOutOfStock).padStart(5)} ║`);
     console.log(`║  ❌ Errors:               ${String(this.stats.errors).padStart(5)} ║`);
-    console.log('╚══════════════════════════════════╝\n');
+    if (this.initialLoad && this.checkpoint) {
+      console.log(`║  📊 Variants today:       ${String(this.checkpoint.variantsCreated).padStart(5)} ║`);
+    }
+    console.log('╚══════════════════════════════════╝');
+    if (paused) {
+      console.log('\n🔁 Resume tomorrow with: node index.js --resume\n');
+    } else {
+      console.log('');
+    }
   }
 }
 
