@@ -297,18 +297,20 @@ class ShopifyAPI {
   // ─── Variants ────────────────────────────────────────────────────────────────
 
   async createVariant(productId, variantData) {
-    const input = { ...variantInputToGraphQL(variantData), productId: toGid('Product', productId) };
-    const data  = await this.graphqlRequest(`
-      mutation productVariantCreate($input: ProductVariantInput!) {
-        productVariantCreate(input: $input) {
-          productVariant { ${VARIANT_FIELDS} }
+    // productVariantCreate was removed in 2025-01; use productVariantsBulkCreate instead.
+    const productGid = toGid('Product', productId);
+    const variant = variantInputToGraphQL(variantData);
+    const data = await this.graphqlRequest(`
+      mutation productVariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+        productVariantsBulkCreate(productId: $productId, variants: $variants) {
+          productVariants { ${VARIANT_FIELDS} }
           userErrors { field message }
         }
       }
-    `, { input });
-    const { productVariant, userErrors } = data.productVariantCreate;
-    if (userErrors?.length) throw new Error(`productVariantCreate: ${userErrors.map(e => e.message).join('; ')}`);
-    return { variant: normalizeVariant(productVariant) };
+    `, { productId: productGid, variants: [variant] });
+    const { productVariants, userErrors } = data.productVariantsBulkCreate;
+    if (userErrors?.length) throw new Error(`productVariantsBulkCreate: ${userErrors.map(e => e.message).join('; ')}`);
+    return { variant: normalizeVariant(productVariants[0]) };
   }
 
   async updateVariant(variantId, variantData) {
@@ -337,21 +339,23 @@ class ShopifyAPI {
 
   async deleteVariant(productId, variantId) {
     const data = await this.graphqlRequest(`
-      mutation productVariantDelete($id: ID!) {
-        productVariantDelete(id: $id) {
-          deletedProductVariantId
+      mutation productVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
+        productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
           userErrors { field message }
         }
       }
-    `, { id: toGid('ProductVariant', variantId) });
-    const { userErrors } = data.productVariantDelete;
-    if (userErrors?.length) throw new Error(`productVariantDelete: ${userErrors.map(e => e.message).join('; ')}`);
+    `, {
+      productId:   toGid('Product', productId),
+      variantsIds: [toGid('ProductVariant', variantId)],
+    });
+    const { userErrors } = data.productVariantsBulkDelete;
+    if (userErrors?.length) throw new Error(`productVariantsBulkDelete: ${userErrors.map(e => e.message).join('; ')}`);
     return true;
   }
 
   // ─── Images ──────────────────────────────────────────────────────────────────
 
-  async addProductImage(productId, imageUrl, altText = '', variantIds = []) {
+  async addProductImage(productId, imageUrl, altText = '') {
     const data = await this.graphqlRequest(`
       mutation productCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
         productCreateMedia(productId: $productId, media: $media) {
@@ -375,24 +379,10 @@ class ShopifyAPI {
     const created = media?.[0];
     if (!created) return null;
 
-    const imageId = fromGid(created.image?.id || created.id);
+    const mediaGid = created.id;
+    const imageId  = fromGid(created.image?.id || created.id);
 
-    // Associate image with specific variants (best-effort)
-    if (variantIds.length && imageId) {
-      for (const variantId of variantIds) {
-        try {
-          await this.graphqlRequest(`
-            mutation productVariantUpdate($input: ProductVariantInput!) {
-              productVariantUpdate(input: $input) {
-                userErrors { field message }
-              }
-            }
-          `, { input: { id: toGid('ProductVariant', variantId), imageId: toGid('ProductImage', imageId) } });
-        } catch (_) { /* best-effort */ }
-      }
-    }
-
-    return { image: { id: imageId, src: created.image?.url, alt: altText } };
+    return { image: { id: imageId, mediaGid, src: created.image?.url, alt: altText } };
   }
 
   async getProductImages(productId) {
@@ -617,6 +607,70 @@ class ShopifyAPI {
 
   // ─── Metafields ───────────────────────────────────────────────────────────────
   // metafieldsSet handles upsert natively — no need to check for existing first.
+
+  async getProductMedia(productId) {
+    const data = await this.graphqlRequest(`
+      query productMedia($id: ID!) {
+        product(id: $id) {
+          media(first: 250) {
+            edges {
+              node {
+                ... on MediaImage {
+                  id
+                  image { altText }
+                }
+              }
+            }
+          }
+        }
+      }
+    `, { id: toGid('Product', productId) });
+    return (data.product?.media?.edges || [])
+      .filter(e => e.node?.id)
+      .map(e => ({ mediaGid: e.node.id, alt: e.node.image?.altText || '' }));
+  }
+
+  async linkMediaToVariants(productId, relinks) {
+    const variantMedia = relinks.flatMap(({ mediaGid, variantIds }) =>
+      variantIds.map(variantId => ({
+        variantId: toGid('ProductVariant', variantId),
+        mediaIds:  [mediaGid],
+      }))
+    );
+    if (!variantMedia.length) return true;
+
+    const maxAttempts = 6;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const data = await this.graphqlRequest(`
+          mutation productVariantAppendMedia($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
+            productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+              userErrors { field message }
+            }
+          }
+        `, { productId: toGid('Product', productId), variantMedia });
+
+        const errors = data.productVariantAppendMedia?.userErrors || [];
+        if (!errors.length) return true;
+
+        const notReady = errors.some(e => /non-?ready/i.test(e.message));
+        if (notReady && attempt < maxAttempts) {
+          console.log(`      ⏳ Media still processing, retrying in 4s... (${attempt}/${maxAttempts})`);
+          await sleep(4000);
+          continue;
+        }
+
+        console.warn(`   ⚠️  linkMediaToVariants: ${errors.map(e => e.message).join('; ')}`);
+        return false;
+      } catch (err) {
+        console.warn(`   ⚠️  linkMediaToVariants: ${err.message}`);
+        return false;
+      }
+    }
+
+    console.warn(`   ⚠️  linkMediaToVariants: media still not ready after ${maxAttempts} attempts`);
+    return false;
+  }
 
   async upsertProductMetafield(productId, { namespace, key, value, type }) {
     const data = await this.graphqlRequest(`

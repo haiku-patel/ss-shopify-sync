@@ -16,8 +16,8 @@ import {
 
 const CHECKPOINT_FILE = './sync-checkpoint.json';
 
-// Shopify REST API hard limit — styles with more variants are split by color
-const MAX_REST_VARIANTS = 100;
+// Shopify GraphQL API supports up to 2000 variants per product
+const MAX_REST_VARIANTS = 2000;
 
 class ProductSync {
   constructor({ initial = false, resume = false } = {}) {
@@ -478,7 +478,7 @@ class ProductSync {
     for (const v of toDelete) {
       try {
         await this.shopify.deleteVariant(productId, v.id);
-        console.log(`     🗑️  Removed discontinued variant: ${v.sku}`);
+        console.log(`     🗑️  Removed variant (OOS or discontinued): ${v.sku}`);
       } catch (err) {
         console.error(`     ⚠️  Delete variant ${v.sku}: ${err.message}`);
       }
@@ -520,17 +520,18 @@ class ProductSync {
       colorVariantMap.get(color).push(variant.id);
     }
 
-    // Fetch existing images and collect alt texts to skip already-uploaded colors
-    let existingAlts = new Set();
+    // Fetch existing media: alt text → MediaImage GID (needed for variant linking)
+    const existingMediaByAlt = new Map();
     try {
-      const existing = await this.shopify.getProductImages(productId);
-      for (const img of existing) {
-        if (img.alt) existingAlts.add(img.alt);
+      const existingMedia = await this.shopify.getProductMedia(productId);
+      for (const m of existingMedia) {
+        if (m.alt) existingMediaByAlt.set(m.alt, m.mediaGid);
       }
     } catch (_) { /* non-fatal */ }
 
     const seenUrls   = new Set();
     const uploads    = [];
+    const relinks    = []; // images already on Shopify that need variant linking
     const seenColors = new Set();
 
     for (const row of ssRows) {
@@ -540,45 +541,49 @@ class ProductSync {
       const variantIds = colorVariantMap.get(row.colorName) || [];
       const alt        = `${row.brandName} ${row.styleName} - ${row.colorName}`;
 
-      // Skip this color if images are already on Shopify
-      if (existingAlts.has(alt)) continue;
+      if (existingMediaByAlt.has(alt)) {
+        // Image already uploaded — re-link to variants (idempotent, fixes missing links)
+        if (variantIds.length) relinks.push({ mediaGid: existingMediaByAlt.get(alt), variantIds });
+        continue;
+      }
 
-      // Front image — linked to variant IDs for color swatch matching
+      // Front image only — linked to variant IDs for color swatch matching
       const frontSrc = ssImageUrl(row.colorFrontImage, 'fl');
       if (frontSrc && !seenUrls.has(frontSrc)) {
         seenUrls.add(frontSrc);
         uploads.push({ src: frontSrc, alt, variantIds });
       }
-
-      // Additional angles — no variant link needed
-      const extraPaths = [
-        row.colorSideImage,
-        row.colorBackImage,
-        row.colorDirectSideImage,
-        row.colorOnModelFrontImage,
-        row.colorOnModelSideImage,
-        row.colorOnModelBackImage,
-      ];
-      for (const imgPath of extraPaths) {
-        const src = ssImageUrl(imgPath, 'fl');
-        if (!src || seenUrls.has(src)) continue;
-        seenUrls.add(src);
-        uploads.push({ src, alt, variantIds: [] });
-      }
     }
 
-    if (!uploads.length) {
+    if (!uploads.length && !relinks.length) {
       console.log(`      🖼️  Images already up to date`);
       return;
     }
 
-    await Promise.allSettled(
-      uploads.map(({ src, alt, variantIds }) =>
-        this.shopify.addProductImage(productId, src, alt, variantIds)
-          .catch(err => console.error(`     ⚠️  Image upload: ${err.message}`))
-      )
-    );
-    console.log(`      🖼️  Uploaded ${uploads.length} image(s)`);
+    // Upload new images and collect their MediaImage GIDs for linking
+    const newRelinks = [];
+    if (uploads.length) {
+      const results = await Promise.allSettled(
+        uploads.map(({ src, alt, variantIds }) =>
+          this.shopify.addProductImage(productId, src, alt)
+            .then(res => ({ mediaGid: res?.image?.mediaGid, variantIds }))
+            .catch(err => { console.error(`     ⚠️  Image upload: ${err.message}`); return null; })
+        )
+      );
+      for (const r of results) {
+        if (r.status === 'fulfilled' && r.value?.mediaGid && r.value.variantIds.length) {
+          newRelinks.push({ mediaGid: r.value.mediaGid, variantIds: r.value.variantIds });
+        }
+      }
+      console.log(`      🖼️  Uploaded ${uploads.length} image(s)`);
+    }
+
+    // Single batched link call for both existing and newly uploaded images
+    const allRelinks = [...relinks, ...newRelinks];
+    if (allRelinks.length) {
+      const linked = await this.shopify.linkMediaToVariants(productId, allRelinks);
+      if (linked) console.log(`      🔗 Linked ${allRelinks.length} colour image(s) to variants`);
+    }
   }
 
   // ─── Removal ──────────────────────────────────────────────────────────────

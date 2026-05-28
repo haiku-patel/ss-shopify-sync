@@ -26,7 +26,8 @@ export const CONFIG = {
 
 const required = [
   'SHOPIFY_SHOP',
-  'SHOPIFY_ACCESS_TOKEN',
+  'SHOPIFY_CLIENT_ID',
+  'SHOPIFY_CLIENT_SECRET',
   'SS_USERNAME',
   'SS_PASSWORD'
 ];
