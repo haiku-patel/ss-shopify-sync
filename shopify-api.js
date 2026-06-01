@@ -44,6 +44,8 @@ function normalizeVariant(node) {
     option2:           opts[1]?.value ?? null,
     option3:           opts[2]?.value ?? null,
     inventory_item_id: fromGid(node.inventoryItem?.id),
+    weight:            node.inventoryItem?.measurement?.weight?.value ?? null,
+    weight_unit:       node.inventoryItem?.measurement?.weight?.unit?.toLowerCase() ?? null,
   };
 }
 
@@ -97,10 +99,16 @@ function productToSetInput(data, productId = null) {
       sku:             v.sku,
       barcode:         v.barcode,
       inventoryPolicy: v.inventory_policy === 'continue' ? 'CONTINUE' : 'DENY',
+      ...(v.weight != null ? { inventoryItem: { measurement: { weight: { value: parseFloat(v.weight), unit: weightUnitToGraphQL(v.weight_unit) } } } } : {}),
     }));
   }
 
   return input;
+}
+
+function weightUnitToGraphQL(unit) {
+  const map = { lb: 'POUNDS', lbs: 'POUNDS', kg: 'KILOGRAMS', g: 'GRAMS', oz: 'OUNCES' };
+  return map[unit?.toLowerCase()] || 'POUNDS';
 }
 
 // Used only for individual variant create/update (not product-level).
@@ -118,6 +126,9 @@ function variantInputToGraphQL(v) {
   if (v.inventory_policy !== undefined) {
     gv.inventoryPolicy = v.inventory_policy === 'continue' ? 'CONTINUE' : 'DENY';
   }
+  if (v.weight !== undefined && v.weight !== null) {
+    gv.inventoryItem = { measurement: { weight: { value: parseFloat(v.weight), unit: weightUnitToGraphQL(v.weight_unit) } } };
+  }
   return gv;
 }
 
@@ -130,7 +141,7 @@ const PRODUCT_FIELDS = `
     edges { node {
       id sku price compareAtPrice barcode
       selectedOptions { name value }
-      inventoryItem { id }
+      inventoryItem { id measurement { weight { unit value } } }
     }}
   }
   images(first: 30) {
@@ -141,7 +152,7 @@ const PRODUCT_FIELDS = `
 const VARIANT_FIELDS = `
   id sku price compareAtPrice barcode
   selectedOptions { name value }
-  inventoryItem { id }
+  inventoryItem { id measurement { weight { unit value } } }
 `;
 
 class ShopifyAPI {
@@ -289,8 +300,11 @@ class ShopifyAPI {
         }
       }
     `, { input: { id: toGid('Product', productId) } });
-    const { userErrors } = data.productDelete;
+    const { deletedProductId, userErrors } = data.productDelete;
     if (userErrors?.length) throw new Error(`productDelete: ${userErrors.map(e => e.message).join('; ')}`);
+    if (!deletedProductId) {
+      console.warn(`   ⚠️  productDelete for ${productId} returned no deletedProductId — Shopify may not have deleted it`);
+    }
     return true;
   }
 

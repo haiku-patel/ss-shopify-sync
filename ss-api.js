@@ -128,6 +128,14 @@ class SSActiveWearAPI {
     console.log('\n✅ All chunks processed');
   }
 
+  // ─── Specs API ────────────────────────────────────────────────────────────────
+  // Returns all spec entries for a style (size measurements, neck size, etc.)
+
+  async getSpecsByStyleId(styleId) {
+    const data = await this.makeRequest(`/v2/specs/?style=${styleId}`);
+    return data || [];
+  }
+
   // ─── Connection test ──────────────────────────────────────────────────────────
   // Fetches a single known style (Gildan 2000) — lightweight, fast, verifies auth.
 

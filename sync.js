@@ -12,6 +12,7 @@ import {
   transformStyleToShopifyProduct,
   diffProduct,
   ssImageUrl,
+  ssSizeChartUrl,
 } from './transformer.js';
 
 const CHECKPOINT_FILE = './sync-checkpoint.json';
@@ -222,9 +223,15 @@ class ProductSync {
       }
 
       if (!validRows.length) {
-        console.log(`      ⚠️  All SKUs excluded — removing listing if it exists`);
-        for (const key of this._getStyleKeys(styleId)) {
-          await this._removeProductByKey(key, rows[0]);
+        console.log(`      ⚠️  All ${rows.length} SKU(s) excluded (${dropshipCount} dropship-only, ${oosCount} out-of-stock)`);
+        const keysToRemove = this._getStyleKeys(styleId);
+        if (!keysToRemove.length) {
+          console.log(`      ℹ️  No Shopify listing found for style ${styleId} — nothing to delete`);
+        } else {
+          console.log(`      🗑️  Targeting ${keysToRemove.length} Shopify listing(s) for deletion: [${keysToRemove.join(', ')}]`);
+          for (const key of keysToRemove) {
+            await this._removeProductByKey(key, rows[0]);
+          }
         }
         return;
       }
@@ -342,6 +349,9 @@ class ProductSync {
     const fullProduct = await this.shopify.getProductById(created.id);
     await writeSeoMetafields(this.shopify, created.id, rows, styleData, fullProduct, this.shop);
 
+    await this._writeSizeChart(created.id, styleData);
+    await this._writeSpecsMetafield(created.id, styleData?.styleID ?? rows[0]?.styleID);
+
     this.stats.created++;
   }
 
@@ -374,8 +384,9 @@ class ProductSync {
     const hasInventoryWork = inventoryChanges.length > 0;
 
     if (!productChanged && !hasVariantWork && !hasInventoryWork) {
-      // Still sync any missing images (e.g. new angles added to transformer)
       await this._syncImages(shopifyProductId, existing.variants, rows);
+      await this._writeSizeChart(shopifyProductId, styleData);
+      await this._writeSpecsMetafield(shopifyProductId, styleData?.styleID ?? rows[0]?.styleID);
       console.log(`   ✅ No change: ${existing.title}`);
       this.stats.noChange++;
       return;
@@ -421,6 +432,9 @@ class ProductSync {
       const latestProduct = await this.shopify.getProductById(shopifyProductId);
       await writeSeoMetafields(this.shopify, shopifyProductId, rows, styleData, latestProduct, this.shop);
     }
+
+    await this._writeSizeChart(shopifyProductId, styleData);
+    await this._writeSpecsMetafield(shopifyProductId, styleData?.styleID ?? rows[0]?.styleID);
 
     this.stats.updated++;
   }
@@ -477,10 +491,11 @@ class ProductSync {
 
     for (const v of toDelete) {
       try {
+        console.log(`     🗑️  Deleting variant ${v.sku} (ID: ${v.id}) — OOS or discontinued`);
         await this.shopify.deleteVariant(productId, v.id);
-        console.log(`     🗑️  Removed variant (OOS or discontinued): ${v.sku}`);
+        console.log(`     ✅ Deleted variant ${v.sku}`);
       } catch (err) {
-        console.error(`     ⚠️  Delete variant ${v.sku}: ${err.message}`);
+        console.error(`     ❌ Delete variant ${v.sku} (ID: ${v.id}) failed: ${err.message}`);
       }
     }
   }
@@ -500,6 +515,43 @@ class ProductSync {
         }
       })
     );
+  }
+
+  // ─── Size chart ───────────────────────────────────────────────────────────
+
+  async _writeSizeChart(productId, styleData) {
+    const sizeChartUrl = ssSizeChartUrl(styleData);
+    if (!sizeChartUrl) return;
+    try {
+      await this.shopify.upsertProductMetafield(productId, {
+        namespace: 'custom',
+        key:       'size_chart',
+        value:     sizeChartUrl,
+        type:      'single_line_text_field',
+      });
+      console.log(`      📏 Size chart metafield written`);
+    } catch (err) {
+      console.error(`      ⚠️  Size chart metafield: ${err.message}`);
+    }
+  }
+
+  // ─── Specs ────────────────────────────────────────────────────────────────
+
+  async _writeSpecsMetafield(productId, styleId) {
+    if (!styleId) return;
+    try {
+      const specs = await this.ssApi.getSpecsByStyleId(styleId);
+      if (!specs.length) return;
+      await this.shopify.upsertProductMetafield(productId, {
+        namespace: 'custom',
+        key:       'specs',
+        value:     JSON.stringify(specs),
+        type:      'json',
+      });
+      console.log(`      📐 Specs metafield written (${specs.length} entries)`);
+    } catch (err) {
+      console.error(`      ⚠️  Specs metafield: ${err.message}`);
+    }
   }
 
   // ─── Images ───────────────────────────────────────────────────────────────
@@ -590,14 +642,18 @@ class ProductSync {
 
   async _removeProductByKey(key, sampleRow) {
     const shopifyProductId = this.existingProductMap.get(key);
-    if (!shopifyProductId) return;
-    console.log(`   🗑️  Removing: ${sampleRow?.brandName} ${sampleRow?.styleName}`);
+    if (!shopifyProductId) {
+      console.log(`      ℹ️  Key "${key}" not in existingProductMap — already removed or never synced`);
+      return;
+    }
+    console.log(`      🗑️  Deleting Shopify product ${shopifyProductId} (${sampleRow?.brandName} ${sampleRow?.styleName})`);
     try {
       await this.shopify.deleteProduct(shopifyProductId);
       this.existingProductMap.delete(key);
       this.stats.removed++;
+      console.log(`      ✅ Deleted product ${shopifyProductId}`);
     } catch (err) {
-      console.error(`   ❌ Remove failed: ${err.message}`);
+      console.error(`      ❌ Delete failed for product ${shopifyProductId}: ${err.message}`);
       this.stats.errors++;
     }
   }

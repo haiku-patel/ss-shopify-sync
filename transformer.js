@@ -87,6 +87,22 @@ function ssImageUrl(path, size = 'fl') {
   return `https://www.ssactivewear.com/${normalised}`;
 }
 
+// Returns the full URL to the size chart image for a style, or null if unavailable.
+// SS stores size chart paths in sizeChart or sizeChartFront on the style object.
+function ssSizeChartUrl(styleData) {
+  if (!styleData) return null;
+  const path = styleData.sizeChart || styleData.sizeChartFront || null;
+  if (!path) {
+    const knownFields = Object.keys(styleData).filter(k => /size|chart/i.test(k));
+    if (knownFields.length) {
+      console.log(`   ℹ️  Size chart: no known field found — possible fields: ${knownFields.join(', ')}`);
+    }
+    return null;
+  }
+  if (path.startsWith('http')) return path;
+  return `https://www.ssactivewear.com/${path}`;
+}
+
 
 // ─── Grouping helpers ─────────────────────────────────────────────────────────
 
@@ -338,7 +354,7 @@ function variantFieldsChanged(existing, fresh) {
   if (String(existing.price)                          !== String(fresh.price))            changes.price            = fresh.price;
   if (String(existing.compare_at_price || '')         !== String(fresh.compare_at_price || '')) changes.compare_at_price = fresh.compare_at_price;
   if ((existing.barcode || '')                        !== (fresh.barcode || ''))           changes.barcode          = fresh.barcode;
-  if (String(existing.weight || 0)                    !== String(fresh.weight || 0))       changes.weight           = fresh.weight;
+  if (String(existing.weight || 0)                    !== String(fresh.weight || 0))     { changes.weight = fresh.weight; changes.weight_unit = fresh.weight_unit; }
 
   return Object.keys(changes).length > 0 ? changes : null;
 }
@@ -379,6 +395,7 @@ export {
   shouldExcludeProduct,
   calculatePrice,
   ssImageUrl,
+  ssSizeChartUrl,
   groupByStyle,
   groupByColor,
   transformStyleToShopifyProduct,
