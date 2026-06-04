@@ -13,6 +13,7 @@ import {
   diffProduct,
   ssImageUrl,
   ssSizeChartUrl,
+  buildSizeChartHtml,
 } from './transformer.js';
 
 const CHECKPOINT_FILE = './sync-checkpoint.json';
@@ -93,6 +94,8 @@ class ProductSync {
         console.warn(`   Variants created today: ${this.checkpoint.variantsCreated.toLocaleString()}`);
         console.warn(`   Run tomorrow with: node index.js --resume`);
         this._saveCheckpoint();
+        this._printStats();
+        process.exit(0);
       }
       return false;
     }
@@ -136,7 +139,13 @@ class ProductSync {
     const styleIds = [...new Set(rows.map(r => r.styleID))];
     const styleMap = await this.ssApi.getStylesByIds(styleIds);
 
-    await this._processChunk(rows, styleMap, 1, 1);
+    // Fetch ALL rows for the affected styles so the diff doesn't treat
+    // unrelated variants as deletions (passing only the filtered SKUs would
+    // cause every other variant on the product to appear in toDelete).
+    const allRows = await this.ssApi.getProductsByStyleIds(styleIds);
+    console.log(`   ↳ ${allRows.length} total SKU(s) fetched for ${styleIds.length} style(s)`);
+
+    await this._processChunk(allRows, styleMap, 1, 1);
     this._printStats();
   }
 
@@ -542,13 +551,25 @@ class ProductSync {
     try {
       const specs = await this.ssApi.getSpecsByStyleId(styleId);
       if (!specs.length) return;
+
       await this.shopify.upsertProductMetafield(productId, {
         namespace: 'custom',
         key:       'specs',
         value:     JSON.stringify(specs),
         type:      'json',
       });
-      console.log(`      📐 Specs metafield written (${specs.length} entries)`);
+
+      const sizeChartHtml = buildSizeChartHtml(specs);
+      if (sizeChartHtml) {
+        await this.shopify.upsertProductMetafield(productId, {
+          namespace: 'custom',
+          key:       'size_chart_html',
+          value:     sizeChartHtml,
+          type:      'multi_line_text_field',
+        });
+      }
+
+      console.log(`      📐 Specs metafield written (${specs.length} entries)${sizeChartHtml ? ' + size chart HTML' : ''}`);
     } catch (err) {
       console.error(`      ⚠️  Specs metafield: ${err.message}`);
     }

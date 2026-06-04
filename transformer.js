@@ -391,6 +391,41 @@ function extractId(gidOrInt) {
 }
 
 
+// ─── Size chart HTML builder ──────────────────────────────────────────────────
+// Pivots the flat specs array (one row per size+specName) into an HTML table.
+// Sizes are sorted by sizeOrder; columns are the unique spec names.
+
+function buildSizeChartHtml(specs) {
+  if (!specs || !specs.length) return null;
+
+  const specNames = [...new Set(specs.map(s => s.specName))];
+
+  const sizeMap = new Map();
+  for (const s of specs) {
+    if (!sizeMap.has(s.sizeName)) {
+      sizeMap.set(s.sizeName, { sizeOrder: s.sizeOrder || 'ZZ', values: {} });
+    }
+    sizeMap.get(s.sizeName).values[s.specName] = s.value;
+  }
+
+  const sizes = [...sizeMap.entries()]
+    .sort((a, b) => a[1].sizeOrder.localeCompare(b[1].sizeOrder))
+    .map(([sizeName, { values }]) => ({ sizeName, values }));
+
+  if (!sizes.length || !specNames.length) return null;
+
+  const th = n => `<th>${n}</th>`;
+  const td = v => `<td>${v ?? ''}</td>`;
+
+  const header = `<tr><th>Size</th>${specNames.map(th).join('')}</tr>`;
+  const rows   = sizes.map(({ sizeName, values }) =>
+    `<tr><td>${sizeName}</td>${specNames.map(n => td(values[n])).join('')}</tr>`
+  ).join('');
+
+  return `<table class="size-chart"><thead>${header}</thead><tbody>${rows}</tbody></table>`;
+}
+
+
 export {
   shouldExcludeProduct,
   calculatePrice,
@@ -403,4 +438,5 @@ export {
   buildVariantMeta,
   diffProduct,
   extractId,
+  buildSizeChartHtml,
 };
