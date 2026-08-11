@@ -1,4 +1,5 @@
 import { CONFIG } from './config.js';
+import { sleep } from './utils.js';
 
 class SSActiveWearAPI {
   constructor() {
@@ -148,10 +149,6 @@ class SSActiveWearAPI {
     }
     throw new Error('SS Activewear: unexpected empty response on connection test');
   }
-}
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
 }
 
 export { SSActiveWearAPI };

@@ -1,18 +1,5 @@
 import { CONFIG } from './config.js';
 
-/**
- * InventoryManager — sets and updates Shopify inventory levels.
- *
- * Inventory table populated per variant:
- *
- *   Location            | Unavailable | Committed | Available | On hand
- *   ────────────────────┼─────────────┼───────────┼───────────┼─────────
- *   Primary (in-store)  |      0      |     0     |     0     |    0    ← always 0
- *   US Warehouse        |      0      |     0     |    qty    |   qty   ← sum of non-dropship SS warehouses
- *
- * Location IDs are resolved by name from Shopify Admin → Settings → Locations,
- * or can be hard-coded in .env to skip the read_locations API scope requirement.
- */
 class InventoryManager {
   constructor(shopifyApi) {
     this.shopify           = shopifyApi;
@@ -75,7 +62,6 @@ class InventoryManager {
     return this;
   }
 
-  // Set inventory for a newly created product.
   async setInventoryForProduct(shopifyVariants, variantMeta) {
     if (!this.inventoryEnabled || !this.primaryLocationId) return;
 
@@ -87,12 +73,10 @@ class InventoryManager {
         try {
           await this.shopify.updateInventoryItem(variant.inventory_item_id, { tracked: true });
 
-          // Primary location (in-store physical) → always 0
           await this.shopify.setInventoryLevel(
             this.primaryLocationId, variant.inventory_item_id, 0
           );
 
-          // US Warehouse → activate location first, then set actual sellable qty
           if (this.usWarehouseId && this.usWarehouseId !== this.primaryLocationId) {
             await this.shopify.activateInventoryAtLocation(variant.inventory_item_id, this.usWarehouseId);
             await this.shopify.setInventoryLevel(
@@ -106,37 +90,6 @@ class InventoryManager {
     );
   }
 
-  // Update inventory for an existing product (only writes when qty changed).
-  async updateInventoryForProduct(shopifyVariants, variantMeta) {
-    if (!this.inventoryEnabled || !this.primaryLocationId) return;
-
-    for (const variant of shopifyVariants) {
-      const meta = variantMeta[variant.sku];
-      if (!meta || !variant.inventory_item_id) continue;
-
-      try {
-        await this._updateLevelIfChanged(
-          this.primaryLocationId, variant.inventory_item_id, 0, variant.sku
-        );
-        if (this.usWarehouseId && this.usWarehouseId !== this.primaryLocationId) {
-          await this._updateLevelIfChanged(
-            this.usWarehouseId, variant.inventory_item_id, meta.usWarehouseQty, variant.sku
-          );
-        }
-      } catch (err) {
-        console.error(`   ⚠️  Inventory update failed for SKU ${variant.sku}: ${err.message}`);
-      }
-    }
-  }
-
-  async _updateLevelIfChanged(locationId, inventoryItemId, newQty, sku) {
-    const levels       = await this.shopify.getInventoryLevels(inventoryItemId);
-    const currentLevel = levels.find(l => l.location_id === locationId);
-    const currentQty   = currentLevel?.available ?? null;
-    if (currentQty !== newQty) {
-      await this.shopify.setInventoryLevel(locationId, inventoryItemId, newQty);
-    }
-  }
 }
 
 export { InventoryManager };

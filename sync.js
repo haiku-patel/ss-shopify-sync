@@ -1,9 +1,12 @@
 import { writeFileSync, readFileSync, existsSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import { SSActiveWearAPI }   from './ss-api.js';
 import { ShopifyAPI }        from './shopify-api.js';
 import { InventoryManager }  from './inventory.js';
 import { CollectionManager } from './collections.js';
 import { CONFIG }            from './config.js';
+import { normaliseTags }     from './utils.js';
 import { writeSeoMetafields } from './seo.js';
 import {
   shouldExcludeProduct,
@@ -16,7 +19,8 @@ import {
   buildSizeChartHtml,
 } from './transformer.js';
 
-const CHECKPOINT_FILE = './sync-checkpoint.json';
+const __dirname      = dirname(fileURLToPath(import.meta.url));
+const CHECKPOINT_FILE = join(__dirname, 'sync-checkpoint.json');
 
 // Shopify GraphQL API supports up to 2000 variants per product
 const MAX_REST_VARIANTS = 2000;
@@ -35,14 +39,11 @@ class ProductSync {
       errors: 0, chunksProcessed: 0,
     };
 
-    // Key is either:
-    //   styleId (number)            — styles with ≤100 variants (one product per style)
-    //   "styleId:colorKey" (string) — styles split by color (one product per color group)
     this.existingProductMap = new Map();
     this.seenProductKeys    = new Set();
 
     this.resumeMode          = resume;
-    this.initialLoad         = initial || resume; // resume implies initial load
+    this.initialLoad         = initial || resume;
     this.checkpoint          = null;
     this.variantLimitReached = false;
   }
@@ -51,23 +52,35 @@ class ProductSync {
 
   _loadCheckpoint() {
     const today = new Date().toISOString().slice(0, 10);
-    if (this.resumeMode && existsSync(CHECKPOINT_FILE)) {
+
+    if (existsSync(CHECKPOINT_FILE)) {
       try {
-        const raw = JSON.parse(readFileSync(CHECKPOINT_FILE, 'utf8'));
-        // Same day: keep variant count so we don't blow past the daily limit again.
-        // New day: reset variant count (quota refreshed) but keep processedKeys.
+        const raw     = JSON.parse(readFileSync(CHECKPOINT_FILE, 'utf8'));
         const sameDay = raw.date === today;
+        const keys    = (raw.processedKeys || []).map(String);
+
+        // Auto-resume: if checkpoint has progress, resume without needing --resume flag.
+        if (keys.length > 0 && !this.resumeMode) {
+          this.resumeMode = true;
+          console.log(`📂 Auto-resuming from checkpoint (${keys.length} style(s) already done)`);
+        }
+
         this.checkpoint = {
           date:            today,
+          // Reset variant count on a new day so the daily quota refreshes.
           variantsCreated: sameDay ? (raw.variantsCreated || 0) : 0,
-          processedKeys:   new Set(raw.processedKeys || []),
+          processedKeys:   new Set(keys),
         };
-        console.log(`📂 Checkpoint loaded: ${this.checkpoint.processedKeys.size} style(s) already done, ${this.checkpoint.variantsCreated} variants created today`);
+
+        if (this.resumeMode) {
+          console.log(`📂 Checkpoint: ${this.checkpoint.processedKeys.size} style(s) done, ${this.checkpoint.variantsCreated} variants created today`);
+        }
         return;
       } catch (_) {
         console.warn('⚠️  Could not read checkpoint — starting fresh');
       }
     }
+
     this.checkpoint = { date: today, variantsCreated: 0, processedKeys: new Set() };
   }
 
@@ -77,7 +90,8 @@ class ProductSync {
       writeFileSync(CHECKPOINT_FILE, JSON.stringify({
         date:            this.checkpoint.date,
         variantsCreated: this.checkpoint.variantsCreated,
-        processedKeys:   [...this.checkpoint.processedKeys],
+        // Normalise to String so keys round-trip through JSON without type mismatch.
+        processedKeys:   [...this.checkpoint.processedKeys].map(String),
       }, null, 2));
     } catch (err) {
       console.warn(`⚠️  Could not save checkpoint: ${err.message}`);
@@ -92,10 +106,8 @@ class ProductSync {
         this.variantLimitReached = true;
         console.warn(`\n⚠️  Daily variant limit (${limit.toLocaleString()}) reached.`);
         console.warn(`   Variants created today: ${this.checkpoint.variantsCreated.toLocaleString()}`);
-        console.warn(`   Run tomorrow with: node index.js --resume`);
+        console.warn(`   Run again tomorrow — progress has been saved.`);
         this._saveCheckpoint();
-        this._printStats();
-        process.exit(0);
       }
       return false;
     }
@@ -139,9 +151,6 @@ class ProductSync {
     const styleIds = [...new Set(rows.map(r => r.styleID))];
     const styleMap = await this.ssApi.getStylesByIds(styleIds);
 
-    // Fetch ALL rows for the affected styles so the diff doesn't treat
-    // unrelated variants as deletions (passing only the filtered SKUs would
-    // cause every other variant on the product to appear in toDelete).
     const allRows = await this.ssApi.getProductsByStyleIds(styleIds);
     console.log(`   ↳ ${allRows.length} total SKU(s) fetched for ${styleIds.length} style(s)`);
 
@@ -158,9 +167,6 @@ class ProductSync {
   }
 
   // ─── Load existing Shopify products ──────────────────────────────────────
-  // Recognises two tag formats:
-  //   ss-style:7269            → regular product  (number key)
-  //   ss-style:7269:White      → split-by-color   (string key "7269:White")
 
   async _loadExistingShopifyProducts() {
     console.log('\n📥 Loading existing Shopify products...');
@@ -214,7 +220,6 @@ class ProductSync {
       const sample = rows[0];
       console.log(`\n   🔍 Style ${styleId} | ${sample?.brandName} ${sample?.styleName} | ${rows.length} SKU(s)`);
 
-      // Step 1: filter excluded SKUs
       const validRows = [];
       let dropshipCount = 0, oosCount = 0;
       for (const row of rows) {
@@ -237,7 +242,7 @@ class ProductSync {
         if (!keysToRemove.length) {
           console.log(`      ℹ️  No Shopify listing found for style ${styleId} — nothing to delete`);
         } else {
-          console.log(`      🗑️  Targeting ${keysToRemove.length} Shopify listing(s) for deletion: [${keysToRemove.join(', ')}]`);
+          console.log(`      🗑️  Targeting ${keysToRemove.length} Shopify listing(s) for deletion`);
           for (const key of keysToRemove) {
             await this._removeProductByKey(key, rows[0]);
           }
@@ -247,7 +252,6 @@ class ProductSync {
 
       const styleData = styleMap?.get(styleId) || null;
 
-      // Step 2: split by color when variants > REST API limit of 100
       if (validRows.length > MAX_REST_VARIANTS) {
         console.log(`   ✂️  Style ${styleId}: ${validRows.length} variants — splitting by color`);
         const colorGroups = groupByColor(validRows);
@@ -256,7 +260,7 @@ class ProductSync {
           const key      = `${styleId}:${colorKey}`;
           this.seenProductKeys.add(key);
 
-          if (this.initialLoad && this.resumeMode && this.checkpoint.processedKeys.has(key)) {
+          if (this.initialLoad && this.resumeMode && this.checkpoint.processedKeys.has(String(key))) {
             console.log(`   ⏩ ${key}: skipped (already processed)`);
             continue;
           }
@@ -269,17 +273,16 @@ class ProductSync {
           }
 
           if (this.initialLoad && !this.variantLimitReached) {
-            this.checkpoint.processedKeys.add(key);
+            this.checkpoint.processedKeys.add(String(key));
             this._saveCheckpoint();
           }
         }
         return;
       }
 
-      // Step 3: regular single-product path
       this.seenProductKeys.add(styleId);
 
-      if (this.initialLoad && this.resumeMode && this.checkpoint.processedKeys.has(styleId)) {
+      if (this.initialLoad && this.resumeMode && this.checkpoint.processedKeys.has(String(styleId))) {
         console.log(`   ⏩ Style ${styleId}: skipped (already processed)`);
         return;
       }
@@ -293,7 +296,7 @@ class ProductSync {
       }
 
       if (this.initialLoad && !this.variantLimitReached) {
-        this.checkpoint.processedKeys.add(styleId);
+        this.checkpoint.processedKeys.add(String(styleId));
         this._saveCheckpoint();
       }
 
@@ -324,7 +327,7 @@ class ProductSync {
 
     let response;
     try {
-      response = await this.shopify.createProduct(product);
+      response = await this.shopify.upsertProduct(product);
     } catch (err) {
       console.error(`   ❌ Shopify rejected "${product.title}": ${err.message}`);
       this.stats.errors++;
@@ -333,7 +336,7 @@ class ProductSync {
 
     const created = response.product;
     if (!created) {
-      console.error(`   ❌ Create failed — no product in response: ${JSON.stringify(response).slice(0, 300)}`);
+      console.error(`   ❌ Create failed — no product in response`);
       this.stats.errors++;
       return;
     }
@@ -416,14 +419,14 @@ class ProductSync {
     if (productChanged) {
       const { styleId, colorKey } = parseProductKey(key);
       const ssTag = colorKey ? `ss-style:${styleId}:${colorKey}` : `ss-style:${styleId}`;
-      await this.shopify.updateProduct(shopifyProductId, {
+      await this.shopify.upsertProduct({
         title:              freshProduct.title,
         body_html:          freshProduct.body_html,
         vendor:             freshProduct.vendor,
         product_type:       freshProduct.product_type,
         tags:               normaliseTags(freshProduct.tags) + `,${ssTag}`,
         taxonomyCategoryId: freshProduct.taxonomyCategoryId,
-      });
+      }, shopifyProductId);
     }
 
     if (hasVariantWork) {
@@ -434,7 +437,6 @@ class ProductSync {
       await this._applyInventoryChanges(inventoryChanges);
     }
 
-    // Sync images — uploads any missing angles or images for newly added colors
     await this._syncImages(shopifyProductId, existing.variants, rows);
 
     if (productChanged) {
@@ -467,7 +469,7 @@ class ProductSync {
             map.set(level.inventory_item_id, level.available ?? null);
           }
         }
-      } catch (_) { /* non-fatal — treat as unchanged */ }
+      } catch (_) { /* non-fatal */ }
     }
     return map;
   }
@@ -475,36 +477,36 @@ class ProductSync {
   // ─── Apply variant changes ─────────────────────────────────────────────────
 
   async _applyVariantChanges(productId, { toAdd, toUpdate, toDelete }) {
-    for (const v of toAdd) {
-      if (this.initialLoad && !this._canCreateVariants(1)) {
-        console.warn(`     ⏸️  Skipping variant add ${v.sku} — daily limit reached`);
-        continue;
-      }
-      try {
-        await this.shopify.createVariant(productId, v);
-        if (this.initialLoad) this.checkpoint.variantsCreated += 1;
-        console.log(`     ➕ Added variant: ${v.sku}`);
-      } catch (err) {
-        console.error(`     ⚠️  Add variant ${v.sku}: ${err.message}`);
-      }
-    }
-
-    for (const { existing, fresh, changed } of toUpdate) {
-      try {
-        await this.shopify.updateVariant(existing.id, changed);
-        console.log(`     ✏️  Updated ${existing.sku}: ${Object.keys(changed).join(', ')}`);
-      } catch (err) {
-        console.error(`     ⚠️  Update variant ${existing.sku}: ${err.message}`);
+    if (toAdd.length) {
+      if (!this.initialLoad || this._canCreateVariants(toAdd.length)) {
+        try {
+          await this.shopify.createVariants(productId, toAdd);
+          if (this.initialLoad) this.checkpoint.variantsCreated += toAdd.length;
+          console.log(`     ➕ Added ${toAdd.length} variant(s)`);
+        } catch (err) {
+          console.error(`     ⚠️  Bulk variant create: ${err.message}`);
+        }
+      } else {
+        console.warn(`     ⏸️  Skipping ${toAdd.length} variant add(s) — daily limit reached`);
       }
     }
 
-    for (const v of toDelete) {
+    if (toUpdate.length) {
       try {
-        console.log(`     🗑️  Deleting variant ${v.sku} (ID: ${v.id}) — OOS or discontinued`);
-        await this.shopify.deleteVariant(productId, v.id);
-        console.log(`     ✅ Deleted variant ${v.sku}`);
+        const updates = toUpdate.map(({ existing, changed }) => ({ id: existing.id, ...changed }));
+        await this.shopify.updateVariants(productId, updates);
+        console.log(`     ✏️  Updated ${toUpdate.length} variant(s)`);
       } catch (err) {
-        console.error(`     ❌ Delete variant ${v.sku} (ID: ${v.id}) failed: ${err.message}`);
+        console.error(`     ⚠️  Bulk variant update: ${err.message}`);
+      }
+    }
+
+    if (toDelete.length) {
+      try {
+        await this.shopify.deleteVariants(productId, toDelete.map(v => v.id));
+        console.log(`     🗑️  Deleted ${toDelete.length} variant(s)`);
+      } catch (err) {
+        console.error(`     ⚠️  Bulk variant delete: ${err.message}`);
       }
     }
   }
@@ -552,16 +554,13 @@ class ProductSync {
       const specs = await this.ssApi.getSpecsByStyleId(styleId);
       if (!specs.length) return;
 
-      await this.shopify.upsertProductMetafield(productId, {
-        namespace: 'custom',
-        key:       'specs',
-        value:     JSON.stringify(specs),
-        type:      'json',
-      });
+      const metafields = [
+        { namespace: 'custom', key: 'specs', value: JSON.stringify(specs), type: 'json' },
+      ];
 
       const sizeChartHtml = buildSizeChartHtml(specs);
       if (sizeChartHtml) {
-        await this.shopify.upsertProductMetafield(productId, {
+        metafields.push({
           namespace: 'custom',
           key:       'size_chart_html',
           value:     sizeChartHtml,
@@ -569,23 +568,16 @@ class ProductSync {
         });
       }
 
-      console.log(`      📐 Specs metafield written (${specs.length} entries)${sizeChartHtml ? ' + size chart HTML' : ''}`);
+      await this.shopify.upsertProductMetafields(productId, metafields);
+      console.log(`      📐 Specs written (${specs.length} entries)${sizeChartHtml ? ' + size chart HTML' : ''}`);
     } catch (err) {
       console.error(`      ⚠️  Specs metafield: ${err.message}`);
     }
   }
 
   // ─── Images ───────────────────────────────────────────────────────────────
-  //
-  // Uploads ALL available image angles for each color:
-  //   - Front image  → linked to the color's variant IDs (drives Shopify color swatch)
-  //   - Side, Back, Direct Side, On-Model Front/Side/Back → no variant link
-  //
-  // Dedup: if ANY image with a color's alt text already exists on the product,
-  // that color is skipped entirely to avoid duplicate uploads on re-runs.
 
   async _syncImages(productId, shopifyVariants, ssRows) {
-    // Map color name → variant IDs so the front image links to the right swatch
     const colorVariantMap = new Map();
     for (const variant of shopifyVariants) {
       const color = variant.option1;
@@ -593,7 +585,6 @@ class ProductSync {
       colorVariantMap.get(color).push(variant.id);
     }
 
-    // Fetch existing media: alt text → MediaImage GID (needed for variant linking)
     const existingMediaByAlt = new Map();
     try {
       const existingMedia = await this.shopify.getProductMedia(productId);
@@ -604,7 +595,7 @@ class ProductSync {
 
     const seenUrls   = new Set();
     const uploads    = [];
-    const relinks    = []; // images already on Shopify that need variant linking
+    const relinks    = [];
     const seenColors = new Set();
 
     for (const row of ssRows) {
@@ -615,12 +606,10 @@ class ProductSync {
       const alt        = `${row.brandName} ${row.styleName} - ${row.colorName}`;
 
       if (existingMediaByAlt.has(alt)) {
-        // Image already uploaded — re-link to variants (idempotent, fixes missing links)
         if (variantIds.length) relinks.push({ mediaGid: existingMediaByAlt.get(alt), variantIds });
         continue;
       }
 
-      // Front image only — linked to variant IDs for color swatch matching
       const frontSrc = ssImageUrl(row.colorFrontImage, 'fl');
       if (frontSrc && !seenUrls.has(frontSrc)) {
         seenUrls.add(frontSrc);
@@ -633,7 +622,6 @@ class ProductSync {
       return;
     }
 
-    // Upload new images and collect their MediaImage GIDs for linking
     const newRelinks = [];
     if (uploads.length) {
       const results = await Promise.allSettled(
@@ -651,7 +639,6 @@ class ProductSync {
       console.log(`      🖼️  Uploaded ${uploads.length} image(s)`);
     }
 
-    // Single batched link call for both existing and newly uploaded images
     const allRelinks = [...relinks, ...newRelinks];
     if (allRelinks.length) {
       const linked = await this.shopify.linkMediaToVariants(productId, allRelinks);
@@ -732,7 +719,7 @@ class ProductSync {
     }
     console.log('╚══════════════════════════════════╝');
     if (paused) {
-      console.log('\n🔁 Resume tomorrow with: node index.js --resume\n');
+      console.log('\n🔁 Resume tomorrow with: node index.js --initial\n');
     } else {
       console.log('');
     }
@@ -740,10 +727,6 @@ class ProductSync {
 }
 
 // ─── Module-level helpers ──────────────────────────────────────────────────────
-
-function normaliseTags(tagsStr) {
-  return (tagsStr || '').split(',').map(t => t.trim()).filter(Boolean).sort().join(',');
-}
 
 function parseProductKey(key) {
   if (typeof key === 'number') return { styleId: key, colorKey: null };

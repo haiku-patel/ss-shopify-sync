@@ -368,29 +368,6 @@ function normaliseTags(tagsStr) {
     .join(',');
 }
 
-function buildProductUpdatePayload(existingShopifyProduct, newRows, styleData = null) {
-  const { product: freshProduct, variantMeta } = transformStyleToShopifyProduct(newRows, styleData);
-
-  const update = {
-    id:           extractId(existingShopifyProduct.id),
-    title:        freshProduct.title,
-    body_html:    freshProduct.body_html,
-    vendor:       freshProduct.vendor,
-    product_type: freshProduct.product_type,
-    tags:         freshProduct.tags,
-    status:       'draft',
-  };
-
-  return { update, variantMeta, freshVariants: freshProduct.variants, freshProduct };
-}
-
-function extractId(gidOrInt) {
-  if (typeof gidOrInt === 'number') return gidOrInt;
-  const match = String(gidOrInt).match(/\/(\d+)$/);
-  return match ? parseInt(match[1]) : gidOrInt;
-}
-
-
 // ─── Size chart HTML builder ──────────────────────────────────────────────────
 // Pivots the flat specs array (one row per size+specName) into an HTML table.
 // Sizes are sorted by sizeOrder; columns are the unique spec names.
@@ -434,9 +411,8 @@ export {
   groupByStyle,
   groupByColor,
   transformStyleToShopifyProduct,
-  buildProductUpdatePayload,
   buildVariantMeta,
   diffProduct,
-  extractId,
+  normaliseTags,
   buildSizeChartHtml,
 };

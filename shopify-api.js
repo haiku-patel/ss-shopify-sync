@@ -1,4 +1,5 @@
 import { CONFIG } from './config.js';
+import { sleep } from './utils.js';
 
 // ─── GID utilities ────────────────────────────────────────────────────────────
 
@@ -60,11 +61,9 @@ function normalizeImage(node) {
 
 // ─── Input adapters ───────────────────────────────────────────────────────────
 
-// Builds a ProductSetInput for the productSet mutation (create or update).
-// options/variants are only included when present so partial updates don't wipe them.
 function productToSetInput(data, productId = null) {
   const input = {};
-  if (productId !== null)           input.id             = toGid('Product', productId);
+  if (productId !== null)              input.id             = toGid('Product', productId);
   if (data.title        !== undefined) input.title           = data.title;
   if (data.body_html    !== undefined) input.descriptionHtml = data.body_html;
   if (data.vendor       !== undefined) input.vendor          = data.vendor;
@@ -83,7 +82,6 @@ function productToSetInput(data, productId = null) {
   const variants = data.variants || [];
 
   if (opts.length && variants.length) {
-    // Collect unique values per option position from the variant list
     input.productOptions = opts.map((opt, i) => {
       const key    = `option${i + 1}`;
       const unique = [...new Set(variants.map(v => v[key]).filter(Boolean))];
@@ -111,7 +109,6 @@ function weightUnitToGraphQL(unit) {
   return map[unit?.toLowerCase()] || 'POUNDS';
 }
 
-// Used only for individual variant create/update (not product-level).
 function variantInputToGraphQL(v) {
   const gv = {};
   const options = [v.option1, v.option2, v.option3].filter(o => o != null);
@@ -166,7 +163,7 @@ class ShopifyAPI {
 
   // ─── Core GraphQL request ────────────────────────────────────────────────────
 
-  async graphqlRequest(query, variables = {}) {
+  async graphqlRequest(query, variables = {}, _retried = false) {
     this.accessToken = process.env.SHOPIFY_ACCESS_TOKEN?.trim() || this.accessToken;
 
     const response = await fetch(this.endpoint, {
@@ -182,7 +179,13 @@ class ShopifyAPI {
       const retryAfter = parseFloat(response.headers.get('Retry-After') || '60');
       console.warn(`⏳ Rate limited — waiting ${retryAfter}s...`);
       await sleep(retryAfter * 1000);
-      return this.graphqlRequest(query, variables);
+      return this.graphqlRequest(query, variables, _retried);
+    }
+
+    if (response.status === 401) {
+      if (_retried) throw new Error('Shopify GraphQL HTTP 401: token refresh did not fix the auth error — check CLIENT_ID/SECRET');
+      await this._refreshAccessToken();
+      return this.graphqlRequest(query, variables, true);
     }
 
     if (!response.ok) {
@@ -192,7 +195,6 @@ class ShopifyAPI {
 
     const json = await response.json();
 
-    // Cost-based throttle: back off when bucket runs low
     const throttle = json.extensions?.cost?.throttleStatus;
     if (throttle && throttle.currentlyAvailable < 100) {
       const waitMs = Math.ceil((100 - throttle.currentlyAvailable) / throttle.restoreRate) * 1000;
@@ -210,6 +212,31 @@ class ShopifyAPI {
     }
 
     return json.data;
+  }
+
+  async _refreshAccessToken() {
+    const clientId     = process.env.SHOPIFY_CLIENT_ID?.trim();
+    const clientSecret = process.env.SHOPIFY_CLIENT_SECRET?.trim();
+    if (!clientId || !clientSecret) throw new Error('Missing SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET');
+
+    const res = await fetch(`https://${this.shop}.myshopify.com/admin/oauth/access_token`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ grant_type: 'client_credentials', client_id: clientId, client_secret: clientSecret }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Token refresh failed (${res.status}): ${text.slice(0, 300)}`);
+    }
+
+    const data  = await res.json();
+    const token = data.access_token;
+    if (!token) throw new Error(`No access_token in refresh response`);
+
+    process.env.SHOPIFY_ACCESS_TOKEN = token;
+    this.accessToken = token;
+    console.log('🔑 Access token refreshed');
   }
 
   // ─── Shop ────────────────────────────────────────────────────────────────────
@@ -261,22 +288,8 @@ class ShopifyAPI {
     return normalizeProduct(data.product);
   }
 
-  async createProduct(productData) {
-    const input = productToSetInput(productData);
-    const data  = await this.graphqlRequest(`
-      mutation productSet($synchronous: Boolean!, $input: ProductSetInput!) {
-        productSet(synchronous: $synchronous, input: $input) {
-          product { ${PRODUCT_FIELDS} }
-          userErrors { field message }
-        }
-      }
-    `, { synchronous: true, input });
-    const { product, userErrors } = data.productSet;
-    if (userErrors?.length) throw new Error(`productSet: ${userErrors.map(e => e.message).join('; ')}`);
-    return { product: normalizeProduct(product) };
-  }
-
-  async updateProduct(productId, productData) {
+  // Single method for both create and update — pass productId to update, omit to create.
+  async upsertProduct(productData, productId = null) {
     const input = productToSetInput(productData, productId);
     const data  = await this.graphqlRequest(`
       mutation productSet($synchronous: Boolean!, $input: ProductSetInput!) {
@@ -310,10 +323,8 @@ class ShopifyAPI {
 
   // ─── Variants ────────────────────────────────────────────────────────────────
 
-  async createVariant(productId, variantData) {
-    // productVariantCreate was removed in 2025-01; use productVariantsBulkCreate instead.
-    const productGid = toGid('Product', productId);
-    const variant = variantInputToGraphQL(variantData);
+  async createVariants(productId, variantDataArray) {
+    const variants = variantDataArray.map(variantInputToGraphQL);
     const data = await this.graphqlRequest(`
       mutation productVariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
         productVariantsBulkCreate(productId: $productId, variants: $variants) {
@@ -321,37 +332,33 @@ class ShopifyAPI {
           userErrors { field message }
         }
       }
-    `, { productId: productGid, variants: [variant] });
+    `, { productId: toGid('Product', productId), variants });
     const { productVariants, userErrors } = data.productVariantsBulkCreate;
     if (userErrors?.length) throw new Error(`productVariantsBulkCreate: ${userErrors.map(e => e.message).join('; ')}`);
-    return { variant: normalizeVariant(productVariants[0]) };
+    return productVariants.map(normalizeVariant);
   }
 
-  async updateVariant(variantId, variantData) {
-    // productVariantUpdate was removed in 2025-01; use productVariantsBulkUpdate instead.
-    // Look up the parent product ID first (one extra query, no signature change needed).
-    const lookup = await this.graphqlRequest(`
-      query variantParent($id: ID!) { productVariant(id: $id) { product { id } } }
-    `, { id: toGid('ProductVariant', variantId) });
-
-    const productGid = lookup.productVariant?.product?.id;
-    if (!productGid) throw new Error(`Cannot find parent product for variant ${variantId}`);
-
-    const variant = { ...variantInputToGraphQL(variantData), id: toGid('ProductVariant', variantId) };
-    const data = await this.graphqlRequest(`
+  // variantUpdates: array of { id, ...changedFields }
+  // productId is required — eliminates the extra parent-lookup query.
+  async updateVariants(productId, variantUpdates) {
+    const variants = variantUpdates.map(({ id, ...data }) => ({
+      ...variantInputToGraphQL(data),
+      id: toGid('ProductVariant', id),
+    }));
+    const gqlData = await this.graphqlRequest(`
       mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
         productVariantsBulkUpdate(productId: $productId, variants: $variants) {
           productVariants { ${VARIANT_FIELDS} }
           userErrors { field message }
         }
       }
-    `, { productId: productGid, variants: [variant] });
-    const { productVariants, userErrors } = data.productVariantsBulkUpdate;
+    `, { productId: toGid('Product', productId), variants });
+    const { productVariants, userErrors } = gqlData.productVariantsBulkUpdate;
     if (userErrors?.length) throw new Error(`productVariantsBulkUpdate: ${userErrors.map(e => e.message).join('; ')}`);
-    return { variant: normalizeVariant(productVariants[0]) };
+    return productVariants.map(normalizeVariant);
   }
 
-  async deleteVariant(productId, variantId) {
+  async deleteVariants(productId, variantIds) {
     const data = await this.graphqlRequest(`
       mutation productVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
         productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
@@ -360,7 +367,7 @@ class ShopifyAPI {
       }
     `, {
       productId:   toGid('Product', productId),
-      variantsIds: [toGid('ProductVariant', variantId)],
+      variantsIds: variantIds.map(id => toGid('ProductVariant', id)),
     });
     const { userErrors } = data.productVariantsBulkDelete;
     if (userErrors?.length) throw new Error(`productVariantsBulkDelete: ${userErrors.map(e => e.message).join('; ')}`);
@@ -397,19 +404,6 @@ class ShopifyAPI {
     const imageId  = fromGid(created.image?.id || created.id);
 
     return { image: { id: imageId, mediaGid, src: created.image?.url, alt: altText } };
-  }
-
-  async getProductImages(productId) {
-    const data = await this.graphqlRequest(`
-      query productImages($id: ID!) {
-        product(id: $id) {
-          images(first: 250) {
-            edges { node { id url altText } }
-          }
-        }
-      }
-    `, { id: toGid('Product', productId) });
-    return (data.product?.images?.edges || []).map(e => normalizeImage(e.node));
   }
 
   // ─── Collections ─────────────────────────────────────────────────────────────
@@ -454,7 +448,6 @@ class ShopifyAPI {
     });
     const { userErrors } = data.collectionAddProducts;
     if (userErrors?.length) {
-      // Mimic REST 422 so collections.js silently ignores duplicates
       throw new Error(`422: ${userErrors.map(e => e.message).join('; ')}`);
     }
     return true;
@@ -490,9 +483,9 @@ class ShopifyAPI {
     const publications = await this.getPublications();
     if (!publications.length) return;
 
-    for (const pub of publications) {
-      try {
-        await this.graphqlRequest(`
+    await Promise.allSettled(
+      publications.map(pub =>
+        this.graphqlRequest(`
           mutation productPublish($input: ProductPublishInput!) {
             productPublish(input: $input) {
               userErrors { field message }
@@ -503,13 +496,13 @@ class ShopifyAPI {
             id: toGid('Product', productId),
             productPublications: [{ publicationId: toGid('Publication', pub.id) }],
           },
-        });
-      } catch (err) {
-        if (!err.message.includes('422')) {
-          console.warn(`   ⚠️  Could not publish to "${pub.name}": ${err.message}`);
-        }
-      }
-    }
+        }).catch(err => {
+          if (!err.message.includes('422')) {
+            console.warn(`   ⚠️  Could not publish to "${pub.name}": ${err.message}`);
+          }
+        })
+      )
+    );
   }
 
   // ─── Inventory ────────────────────────────────────────────────────────────────
@@ -620,7 +613,28 @@ class ShopifyAPI {
   }
 
   // ─── Metafields ───────────────────────────────────────────────────────────────
-  // metafieldsSet handles upsert natively — no need to check for existing first.
+
+  async upsertProductMetafields(productId, metafields) {
+    const data = await this.graphqlRequest(`
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { id }
+          userErrors { field message }
+        }
+      }
+    `, {
+      metafields: metafields.map(mf => ({ ownerId: toGid('Product', productId), ...mf })),
+    });
+    const { userErrors } = data.metafieldsSet;
+    if (userErrors?.length) throw new Error(`metafieldsSet: ${userErrors.map(e => e.message).join('; ')}`);
+    return true;
+  }
+
+  async upsertProductMetafield(productId, mf) {
+    return this.upsertProductMetafields(productId, [mf]);
+  }
+
+  // ─── Media ────────────────────────────────────────────────────────────────────
 
   async getProductMedia(productId) {
     const data = await this.graphqlRequest(`
@@ -642,6 +656,105 @@ class ShopifyAPI {
     return (data.product?.media?.edges || [])
       .filter(e => e.node?.id)
       .map(e => ({ mediaGid: e.node.id, alt: e.node.image?.altText || '' }));
+  }
+
+  // ─── Bulk Operations ──────────────────────────────────────────────────────────
+
+  // Stage a JSONL file for bulk mutation upload, then POST it to the signed URL.
+  // Returns the resourceUrl which is passed as stagedUploadPath to runBulkMutation.
+  async stagedUpload(filename, content, mimeType = 'text/plain') {
+    const data = await this.graphqlRequest(`
+      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+        stagedUploadsCreate(input: $input) {
+          stagedTargets {
+            url
+            resourceUrl
+            parameters { name value }
+          }
+          userErrors { field message }
+        }
+      }
+    `, {
+      input: [{
+        filename,
+        mimeType,
+        httpMethod: 'POST',
+        resource:   'BULK_MUTATION_VARIABLES',
+      }],
+    });
+
+    const { stagedTargets, userErrors } = data.stagedUploadsCreate;
+    if (userErrors?.length) throw new Error(`stagedUploadsCreate: ${userErrors.map(e => e.message).join('; ')}`);
+
+    const { url, resourceUrl, parameters } = stagedTargets[0];
+
+    // Parameters must come before the file, and the file must be last.
+    const form = new FormData();
+    for (const { name, value } of parameters) form.append(name, value);
+    form.append('file', new Blob([content], { type: mimeType }), filename);
+
+    const uploadRes = await fetch(url, { method: 'POST', body: form });
+    if (!uploadRes.ok) {
+      const text = await uploadRes.text();
+      throw new Error(`Staged upload HTTP ${uploadRes.status}: ${text.slice(0, 300)}`);
+    }
+
+    return resourceUrl;
+  }
+
+  async runBulkMutation(stagedUploadPath, mutation) {
+    const data = await this.graphqlRequest(`
+      mutation bulkOperationRunMutation($mutation: String!, $stagedUploadPath: String!) {
+        bulkOperationRunMutation(mutation: $mutation, stagedUploadPath: $stagedUploadPath) {
+          bulkOperation { id status url errorCode }
+          userErrors { field message }
+        }
+      }
+    `, { mutation, stagedUploadPath });
+
+    const { bulkOperation, userErrors } = data.bulkOperationRunMutation;
+    if (userErrors?.length) throw new Error(`bulkOperationRunMutation: ${userErrors.map(e => e.message).join('; ')}`);
+    return bulkOperation;
+  }
+
+  // Polls currentBulkOperation until the job is COMPLETED, FAILED, or CANCELED.
+  // Starts at 8s intervals, backs off to 30s after the first minute.
+  async pollBulkOperation(bulkOpId) {
+    let intervalMs = 8000;
+    let attempts   = 0;
+
+    while (true) {
+      await sleep(intervalMs);
+      attempts++;
+
+      const data = await this.graphqlRequest(`{
+        currentBulkOperation(type: MUTATION) {
+          id status url errorCode objectCount
+        }
+      }`);
+
+      const op = data.currentBulkOperation;
+      if (!op) throw new Error('No current bulk operation found');
+      if (op.id !== bulkOpId) throw new Error(`Expected bulk op ${bulkOpId} but found ${op.id} — another operation may have replaced it`);
+
+      const elapsed = Math.round((attempts * intervalMs) / 1000);
+      process.stdout.write(`\r   Status: ${op.status} | ${op.objectCount ?? 0} processed | ${elapsed}s elapsed   `);
+
+      if (op.status === 'COMPLETED') { console.log(''); return op; }
+      if (op.status === 'FAILED')    throw new Error(`Bulk operation failed: ${op.errorCode || 'unknown'}`);
+      if (op.status === 'CANCELED')  throw new Error('Bulk operation was canceled');
+
+      if (attempts > 8 && intervalMs < 30000) intervalMs = 30000;
+    }
+  }
+
+  // Downloads the result JSONL from the URL returned by pollBulkOperation.
+  // Each line is a JSON object with the mutation result for one input line.
+  async downloadBulkResults(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Failed to download bulk results: ${res.status}`);
+    const text = await res.text();
+    return text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   }
 
   async linkMediaToVariants(productId, relinks) {
@@ -685,26 +798,6 @@ class ShopifyAPI {
     console.warn(`   ⚠️  linkMediaToVariants: media still not ready after ${maxAttempts} attempts`);
     return false;
   }
-
-  async upsertProductMetafield(productId, { namespace, key, value, type }) {
-    const data = await this.graphqlRequest(`
-      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-        metafieldsSet(metafields: $metafields) {
-          metafields { id }
-          userErrors { field message }
-        }
-      }
-    `, {
-      metafields: [{ ownerId: toGid('Product', productId), namespace, key, value, type }],
-    });
-    const { userErrors } = data.metafieldsSet;
-    if (userErrors?.length) throw new Error(`metafieldsSet: ${userErrors.map(e => e.message).join('; ')}`);
-    return true;
-  }
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
-export { ShopifyAPI };
+export { ShopifyAPI, fromGid, productToSetInput };

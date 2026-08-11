@@ -8,6 +8,7 @@
  */
 
 import { ssImageUrl } from './transformer.js';
+import { CONFIG } from './config.js';
 
 function stripHtml(html) {
   return (html || '').replace(/<[^>]+>/g, ' ').replace(/\s{2,}/g, ' ').trim();
@@ -62,7 +63,7 @@ function buildSchemaJson(rows, styleData, shopifyProduct, shop) {
   const productUrl = shopifyProduct?.handle ? `${storeUrl}/products/${shopifyProduct.handle}` : storeUrl;
 
   const offers = rows.map(row => {
-    const price    = (parseFloat(row.customerPrice || 0) * 1.40).toFixed(2);
+    const price    = (parseFloat(row.customerPrice || 0) * CONFIG.sync.priceMarkupMultiplier).toFixed(2);
     const totalQty = (row.warehouses || [])
       .filter(w => !w.dropship)
       .reduce((s, w) => s + (w.qty || 0), 0);
@@ -133,15 +134,12 @@ async function writeSeoMetafields(shopifyApi, productId, rows, styleData, shopif
     },
   ];
 
-  for (const mf of metafields) {
-    try {
-      await shopifyApi.upsertProductMetafield(productId, mf);
-    } catch (err) {
-      console.error(`   ⚠️  SEO metafield [${mf.namespace}.${mf.key}]: ${err.message}`);
-    }
+  try {
+    await shopifyApi.upsertProductMetafields(productId, metafields);
+    console.log(`   🔍 SEO metafields written for product ${productId}`);
+  } catch (err) {
+    console.error(`   ⚠️  SEO metafields: ${err.message}`);
   }
-
-  console.log(`   🔍 SEO metafields written for product ${productId}`);
 }
 
 export { writeSeoMetafields, buildSeoTitle, buildMetaDescription, buildSchemaJson };

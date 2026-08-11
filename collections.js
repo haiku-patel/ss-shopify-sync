@@ -1,15 +1,3 @@
-/**
- * CollectionManager — assigns products to Shopify custom collections.
- *
- * Collections created per product:
- *   - By baseCategory  (e.g. "T-Shirts", "Hoodies")
- *   - By brand         (e.g. "Gildan", "Bella + Canvas")
- *   - By color family  (e.g. "Neutrals", "Blues")
- *
- * Collections are created on first encounter and cached for the run.
- * Re-running is safe — Shopify returns 422 when a product is already in a
- * collection, which is silently ignored.
- */
 class CollectionManager {
   constructor(shopifyApi) {
     this.shopify         = shopifyApi;
