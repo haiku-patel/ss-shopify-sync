@@ -17,6 +17,7 @@ import {
   ssImageUrl,
   ssSizeChartUrl,
   buildSizeChartHtml,
+  getCleanCategory,
 } from './transformer.js';
 
 const __dirname      = dirname(fileURLToPath(import.meta.url));
@@ -352,7 +353,7 @@ class ProductSync {
     await this._syncImages(created.id, created.variants, rows);
 
     console.log(`      📂 Assigning collections...`);
-    await this.collections.assignProduct(created.id, sample.brandName, sample.colorFamily, styleData?.baseCategory);
+    await this.collections.assignProduct(created.id, sample.brandName, sample.colorFamily, getCleanCategory(styleData?.baseCategory));
 
     console.log(`      📢 Publishing to sales channels...`);
     await this.shopify.publishToAllChannels(created.id);
@@ -413,7 +414,7 @@ class ProductSync {
     console.log(`   🔄 Updating: ${existing.title} [${changes.join(', ')}]`);
 
     const sample = rows[0];
-    await this.collections.assignProduct(shopifyProductId, sample.brandName, sample.colorFamily, styleData?.baseCategory);
+    await this.collections.assignProduct(shopifyProductId, sample.brandName, sample.colorFamily, getCleanCategory(styleData?.baseCategory));
     await this.shopify.publishToAllChannels(shopifyProductId);
 
     if (productChanged) {

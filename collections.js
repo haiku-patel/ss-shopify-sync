@@ -34,6 +34,14 @@ class CollectionManager {
     await Promise.all(assignments);
   }
 
+  // Adds a product to the collection matching `category`, creating it if needed.
+  // Used by the one-off backfill script to reconcile products against the
+  // in-memory collectionCache without duplicating _safeAdd's 422 handling.
+  async assignToCategory(productId, category) {
+    if (!category) return;
+    await this._safeAdd(await this.getOrCreate(category), productId, category);
+  }
+
   async _safeAdd(collectionId, productId, label) {
     try {
       await this.shopify.addProductToCollection(collectionId, productId);

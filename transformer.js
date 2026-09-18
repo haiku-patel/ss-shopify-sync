@@ -34,6 +34,43 @@ const CATEGORY_MAP = {
   'Bags':                    'gid://shopify/TaxonomyCategory/lb',          // Luggage & Bags
 };
 
+// ─── Clean display-name mapping ───────────────────────────────────────────────
+// Maps SS baseCategory → collapsed, customer-facing display name. Used for
+// product_type, tags, description, SEO, and collection titles. Does NOT affect
+// CATEGORY_MAP / taxonomyCategoryId above — Shopify's standard taxonomy stays
+// exactly as granular as it already was.
+
+const CLEAN_CATEGORY_MAP = {
+  'T-Shirts - Core':         'T-Shirts',
+  'T-Shirts - Long Sleeve':  'T-Shirts',
+  'T-Shirts - Premium':      'T-Shirts',
+  'Fleece - Core - Crew':    'Sweatshirts',
+  'Fleece - Premium - Crew': 'Sweatshirts',
+  'Fleece - Core - Hood':    'Hoodies',
+  'Fleece - Premium - Hood': 'Hoodies',
+  'Wovens':                  'Shirts',
+  'Knits & Layering':        'Sweaters',
+  'Polos':                   'Polos',
+  'Headwear':                'Headwear',
+  'Bottoms':                 'Bottoms',
+  'Outerwear':               'Outerwear',
+  'Accessories':             'Accessories',
+  'Bags':                    'Bags',
+};
+
+// Collapses a raw SS baseCategory into its clean display name. Falls back to
+// the raw value itself (never drops data) if SS introduces a category that
+// hasn't been added to CLEAN_CATEGORY_MAP (and CATEGORY_MAP) yet.
+function getCleanCategory(baseCategory) {
+  if (!baseCategory) return null;
+  const clean = CLEAN_CATEGORY_MAP[baseCategory];
+  if (clean === undefined) {
+    console.warn(`   ⚠️  Unmapped baseCategory "${baseCategory}" — add it to CLEAN_CATEGORY_MAP (and CATEGORY_MAP) in transformer.js. Using raw value for now.`);
+    return baseCategory;
+  }
+  return clean;
+}
+
 // ─── Filtering ────────────────────────────────────────────────────────────────
 
 /**
@@ -167,7 +204,7 @@ function buildDescription(rows, styleData) {
   const detailLines = [
     `<li><strong>Brand:</strong> ${sample.brandName}</li>`,
     `<li><strong>Style:</strong> ${sample.styleName}${styleData?.title ? ` — ${styleData.title}` : ''}</li>`,
-    styleData?.baseCategory ? `<li><strong>Category:</strong> ${styleData.baseCategory}</li>` : '',
+    styleData?.baseCategory ? `<li><strong>Category:</strong> ${getCleanCategory(styleData.baseCategory)}</li>` : '',
     `<li><strong>Available Colors:</strong> ${colors.join(', ')}</li>`,
     `<li><strong>Available Sizes:</strong> ${sizes.join(', ')}</li>`,
     sample.countryOfOrigin ? `<li><strong>Country of Origin:</strong> ${sample.countryOfOrigin}</li>` : '',
@@ -188,7 +225,7 @@ function buildTags(rows, styleData) {
     sample.brandName,
     sample.styleName,
     sample.colorFamily,
-    styleData?.baseCategory,
+    getCleanCategory(styleData?.baseCategory),
     styleData?.title,
   ]);
 
@@ -269,7 +306,7 @@ function transformStyleToShopifyProduct(rows, styleData = null) {
     title:              productTitle,
     body_html:          buildDescription(rows, styleData),
     vendor:             sample.brandName,
-    product_type:       baseCategory || sample.colorFamily || 'Activewear',
+    product_type:       getCleanCategory(baseCategory) || sample.colorFamily || 'Activewear',
     tags:               buildTags(rows, styleData).join(','),
     status:             'draft',
     taxonomyCategoryId: CATEGORY_MAP[baseCategory] || null,
@@ -415,4 +452,6 @@ export {
   diffProduct,
   normaliseTags,
   buildSizeChartHtml,
+  CLEAN_CATEGORY_MAP,
+  getCleanCategory,
 };

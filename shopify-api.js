@@ -453,6 +453,25 @@ class ShopifyAPI {
     return true;
   }
 
+  // Deletes a custom collection. Does NOT delete or unpublish the products in
+  // it — Shopify doesn't require a collection to be emptied first.
+  async deleteCustomCollection(collectionId) {
+    const data = await this.graphqlRequest(`
+      mutation collectionDelete($input: CollectionDeleteInput!) {
+        collectionDelete(input: $input) {
+          deletedCollectionId
+          userErrors { field message }
+        }
+      }
+    `, { input: { id: toGid('Collection', collectionId) } });
+    const { deletedCollectionId, userErrors } = data.collectionDelete;
+    if (userErrors?.length) throw new Error(`collectionDelete: ${userErrors.map(e => e.message).join('; ')}`);
+    if (!deletedCollectionId) {
+      console.warn(`   ⚠️  collectionDelete for ${collectionId} returned no deletedCollectionId — Shopify may not have deleted it`);
+    }
+    return true;
+  }
+
   // ─── Sales channel publishing ─────────────────────────────────────────────────
 
   async getPublications() {

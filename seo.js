@@ -7,7 +7,7 @@
  *  3. seo.schema_json        — Schema.org Product JSON-LD (for Google Rich Results)
  */
 
-import { ssImageUrl } from './transformer.js';
+import { ssImageUrl, getCleanCategory } from './transformer.js';
 import { CONFIG } from './config.js';
 
 function stripHtml(html) {
@@ -39,7 +39,7 @@ function buildMetaDescription(rows, styleData, productTitle) {
 
   const colorStr = colors.slice(0, 5).join(', ') + (colors.length > 5 ? ` +${colors.length - 5} more` : '');
   const sizeStr  = sizes.join(', ');
-  const cat      = styleData?.baseCategory ? ` ${styleData.baseCategory}.` : '.';
+  const cat      = styleData?.baseCategory ? ` ${getCleanCategory(styleData.baseCategory)}.` : '.';
 
   return truncate(
     `${base}${productTitle}${cat} Available in ${colors.length} color${colors.length > 1 ? 's' : ''}: ${colorStr}. Sizes: ${sizeStr}. Shop wholesale activewear from ${sample.brandName}.`,
@@ -90,7 +90,7 @@ function buildSchemaJson(rows, styleData, shopifyProduct, shop) {
     brand:        { '@type': 'Brand', name: sample.brandName },
     sku:          sample.sku,
     mpn:          sample.styleName,
-    category:     styleData?.baseCategory || sample.colorFamily || 'Activewear',
+    category:     getCleanCategory(styleData?.baseCategory) || sample.colorFamily || 'Activewear',
     image:        images,
     color:        colors,
     size:         sizes,
